@@ -1,0 +1,52 @@
+---
+# =====================================================================
+#  destroy.yml — delete everything create.yml made
+#
+#  ansible-playbook destroy.yml
+# =====================================================================
+- name: Destroy Project One on Google Cloud
+  hosts: localhost
+  gather_facts: false
+  module_defaults:
+    group/google.cloud.gcp:
+      project: "{{ gcp_project }}"
+      auth_kind: serviceaccount
+      service_account_file: "{{ gcp_cred_file }}"
+
+  tasks:
+    - name: Delete the machines
+      google.cloud.gcp_compute_instance:
+        name: "{{ prefix }}-{{ item.name }}"
+        zone: "{{ gcp_zone }}"
+        state: absent
+      loop: "{{ machines }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Release the static IPs
+      google.cloud.gcp_compute_address:
+        name: "{{ prefix }}-{{ item.name }}-ip"
+        region: "{{ gcp_region }}"
+        state: absent
+      loop: "{{ machines }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Delete the firewall rule
+      google.cloud.gcp_compute_firewall:
+        name: "{{ prefix }}-allow-web"
+        state: absent
+
+    - name: Delete the subnet
+      google.cloud.gcp_compute_subnetwork:
+        name: "{{ prefix }}-subnet"
+        region: "{{ gcp_region }}"
+        network:
+          selfLink: "projects/{{ gcp_project }}/global/networks/{{ prefix }}-net"
+        ip_cidr_range: "{{ subnet_cidr }}"
+        state: absent
+
+    - name: Delete the network
+      google.cloud.gcp_compute_network:
+        name: "{{ prefix }}-net"
+        state: absent

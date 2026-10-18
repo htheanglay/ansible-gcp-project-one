@@ -1,0 +1,315 @@
+---
+- name: Create the machines on Google Cloud
+  hosts: localhost
+  gather_facts: false
+  module_defaults:
+    group/google.cloud.gcp:
+      project: "{{ gcp_project }}"
+      auth_kind: serviceaccount
+      service_account_file: "{{ gcp_cred_file }}"
+
+  tasks:
+    - name: Create a network
+      google.cloud.gcp_compute_network:
+        name: "{{ prefix }}-net"
+        auto_create_subnetworks: false
+      register: network
+
+    - name: Create a subnet
+      google.cloud.gcp_compute_subnetwork:
+        name: "{{ prefix }}-subnet"
+        region: "{{ gcp_region }}"
+        network: "{{ network }}"
+        ip_cidr_range: "{{ subnet_cidr }}"
+      register: subnet
+
+    - name: Open ports 22 (SSH), 80/443 (HTTPS) and 9443 (Portainer)
+      google.cloud.gcp_compute_firewall:
+        name: "{{ prefix }}-allow-web"
+        network: "{{ network }}"
+        source_ranges: ["0.0.0.0/0"]
+        target_tags: ["{{ prefix }}-web"]
+        allowed:
+          - ip_protocol: tcp
+            ports: ["22", "80", "443", "9443"]
+
+    - name: Reserve a static IP for each machine
+      google.cloud.gcp_compute_address:
+        name: "{{ prefix }}-{{ item.name }}-ip"
+        region: "{{ gcp_region }}"
+      loop: "{{ machines }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: ips
+
+    - name: Create the machines (Ubuntu 22.04)
+      google.cloud.gcp_compute_instance:
+        name: "{{ prefix }}-{{ item.name }}"
+        zone: "{{ gcp_zone }}"
+        machine_type: "{{ item.machine_type }}"
+        labels:
+          managed_by: ansible
+          role: "{{ item.name }}"
+        tags:
+          items: ["{{ prefix }}-web"]
+        disks:
+          - boot: true
+            auto_delete: true
+            initialize_params:
+              source_image: "{{ gcp_image }}"
+              disk_size_gb: "{{ item.disk_gb }}"
+        network_interfaces:
+          - network: "{{ network }}"
+            subnetwork: "{{ subnet }}"
+            access_configs:
+              - name: External NAT
+                nat_ip: "{{ ips.results[idx] }}"
+                type: ONE_TO_ONE_NAT
+        metadata:
+          ssh-keys: "{{ ssh_user }}:{{ lookup('file', ssh_pubkey_file) }}"
+      loop: "{{ machines }}"
+      loop_control:
+        index_var: idx
+        label: "{{ item.name }}"
+
+    - name: DNS A records to set at your registrar
+      ansible.builtin.debug:
+        msg: "{{ item.name }}.{{ domain }}  ->  {{ ips.results[idx].address }}"
+      loop: "{{ machines }}"
+      loop_control:
+        index_var: idx
+        label: "{{ item.name }}"
+
+    - name: Add the machines to the inventory
+      ansible.builtin.add_host:
+        name: "{{ item.name }}"
+        groups: ["{{ item.name }}", "managed"]
+        ansible_host: "{{ ips.results[idx].address }}"
+        ansible_user: "{{ ssh_user }}"
+        app_port: "{{ item.port }}"
+      loop: "{{ machines }}"
+      loop_control:
+        index_var: idx
+        label: "{{ item.name }}"
+      changed_when: false
+
+# ---------------------------------------------------------------------
+# 2. Install packages on all 3 machines
+# ---------------------------------------------------------------------
+- name: Install packages (Docker, tree, gh, Oh My Zsh, Portainer)
+  hosts: managed
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Wait until Ansible can log in over SSH
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+
+    - name: Wait for the first boot to finish (cloud-init sets up apt)
+      ansible.builtin.command: cloud-init status --wait
+      register: boot
+      changed_when: false
+      failed_when: boot.rc not in [0, 2]   # 2 = finished with warnings
+
+    - name: Install Docker, tree, gh, zsh, git, curl
+      ansible.builtin.apt:
+        name: [docker.io, tree, gh, zsh, git, curl]
+        update_cache: true
+        lock_timeout: 600        # a new VM may still be running its own updates
+
+    - name: Let {{ ssh_user }} use Docker, and make zsh its shell
+      ansible.builtin.user:
+        name: "{{ ssh_user }}"
+        groups: docker
+        append: true
+        shell: /usr/bin/zsh
+
+    - name: Install Oh My Zsh
+      ansible.builtin.shell: |
+        sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
+      args:
+        creates: "/home/{{ ssh_user }}/.oh-my-zsh"
+      become_user: "{{ ssh_user }}"
+
+    - name: Run Portainer (Docker web UI) on port 9443
+      community.docker.docker_container:
+        name: portainer
+        image: portainer/portainer-ce:lts
+        restart_policy: always
+        published_ports: ["9443:9443"]
+        volumes:
+          - /var/run/docker.sock:/var/run/docker.sock
+          - portainer_data:/data
+
+# ---------------------------------------------------------------------
+# 3. Jenkins in Docker
+# ---------------------------------------------------------------------
+- name: Jenkins
+  hosts: jenkins
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Run Jenkins in Docker
+      community.docker.docker_container:
+        name: jenkins
+        image: jenkins/jenkins:lts-jdk21
+        restart_policy: unless-stopped
+        published_ports: ["127.0.0.1:8080:8080"]
+        volumes:
+          - jenkins_home:/var/jenkins_home
+
+    - name: Wait for Jenkins to start
+      ansible.builtin.uri:
+        url: http://localhost:8080/login
+        status_code: [200, 403]
+      register: page
+      until: page.status in [200, 403]
+      retries: 30
+      delay: 10
+
+    - name: Read the Jenkins first-login password
+      ansible.builtin.command: docker exec jenkins cat /var/jenkins_home/secrets/initialAdminPassword
+      register: first_password
+      changed_when: false
+      failed_when: false
+
+# ---------------------------------------------------------------------
+# 4. SonarQube (+ its PostgreSQL database) in Docker
+# ---------------------------------------------------------------------
+- name: SonarQube
+  hosts: sonarqube
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Raise vm.max_map_count (SonarQube's search engine needs it)
+      ansible.posix.sysctl:
+        name: vm.max_map_count
+        value: "524288"
+
+    - name: Create a Docker network for SonarQube and its database
+      community.docker.docker_network:
+        name: sonar
+
+    - name: Run PostgreSQL (SonarQube's database)
+      community.docker.docker_container:
+        name: sonar_db
+        image: postgres:15
+        restart_policy: unless-stopped
+        networks:
+          - name: sonar
+        env:
+          POSTGRES_USER: sonar
+          POSTGRES_PASSWORD: "{{ vault_sonar_db_password }}"
+          POSTGRES_DB: sonar
+        volumes:
+          - sonar_db:/var/lib/postgresql/data
+
+    - name: Run SonarQube in Docker
+      community.docker.docker_container:
+        name: sonarqube
+        image: sonarqube:community
+        restart_policy: unless-stopped
+        networks:
+          - name: sonar
+        published_ports: ["127.0.0.1:9000:9000"]
+        env:
+          SONAR_JDBC_URL: jdbc:postgresql://sonar_db:5432/sonar
+          SONAR_JDBC_USERNAME: sonar
+          SONAR_JDBC_PASSWORD: "{{ vault_sonar_db_password }}"
+        volumes:
+          - sonarqube_data:/opt/sonarqube/data
+          - sonarqube_extensions:/opt/sonarqube/extensions
+
+    - name: Wait for SonarQube to start (2-3 min)
+      ansible.builtin.uri:
+        url: http://localhost:9000/api/system/status
+        return_content: true
+      register: page
+      until: page.status == 200 and '"UP"' in page.content
+      retries: 40
+      delay: 15
+
+# ---------------------------------------------------------------------
+# 5. Nexus in Docker
+# ---------------------------------------------------------------------
+- name: Nexus
+  hosts: nexus
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Run Nexus in Docker
+      community.docker.docker_container:
+        name: nexus
+        image: sonatype/nexus3:latest
+        restart_policy: unless-stopped
+        published_ports: ["127.0.0.1:8081:8081"]
+        env:
+          INSTALL4J_ADD_VM_PARAMS: "-Xms1g -Xmx1g -XX:MaxDirectMemorySize=1g"
+        volumes:
+          - nexus_data:/nexus-data
+
+    - name: Wait for Nexus to start (2-3 min)
+      ansible.builtin.uri:
+        url: http://localhost:8081/service/rest/v1/status
+      register: page
+      until: page.status == 200
+      retries: 40
+      delay: 15
+
+    - name: Read the Nexus first-login password
+      ansible.builtin.command: docker exec nexus cat /nexus-data/admin.password
+      register: first_password
+      changed_when: false
+      failed_when: false
+
+# ---------------------------------------------------------------------
+# 6. HTTPS for all 3 sites: Caddy gets a free Let's Encrypt certificate
+#    and forwards https://<name>.<domain> to the app's port
+# ---------------------------------------------------------------------
+- name: HTTPS for all 3 sites
+  hosts: managed
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Run Caddy in front of the app
+      community.docker.docker_container:
+        name: caddy
+        image: caddy:2
+        restart_policy: unless-stopped
+        network_mode: host
+        command: caddy reverse-proxy --from {{ inventory_hostname }}.{{ domain }} --to localhost:{{ app_port }}
+        volumes:
+          - caddy_data:/data
+
+# ---------------------------------------------------------------------
+# 7. Check the websites and show where everything is
+# ---------------------------------------------------------------------
+- name: Summary
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Check each website answers over HTTPS
+      ansible.builtin.uri:
+        url: "https://{{ item.name }}.{{ domain }}"
+        status_code: [200, 403]
+      register: site
+      until: site.status in [200, 403]
+      retries: 20
+      delay: 15
+      loop: "{{ machines }}"
+      loop_control:
+        label: "https://{{ item.name }}.{{ domain }}"
+
+    - name: Your services
+      ansible.builtin.debug:
+        msg:
+          - "Jenkins    https://jenkins.{{ domain }}    first password: {{ hostvars['jenkins'].first_password.stdout | default('') or 'already set up' }}"
+          - "SonarQube  https://sonarqube.{{ domain }}  login: admin / admin"
+          - "Nexus      https://nexus.{{ domain }}      login: admin / {{ hostvars['nexus'].first_password.stdout | default('') or 'already set up' }}"
+          - "Portainer  https://{{ hostvars['jenkins'].ansible_host }}:9443  (create the admin within 5 min, or: docker restart portainer)"

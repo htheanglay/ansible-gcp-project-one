@@ -1,0 +1,32 @@
+---
+# ---------- Google Cloud ----------
+gcp_project: testing-ab852
+gcp_region: asia-southeast1
+gcp_zone: asia-southeast1-b
+gcp_cred_file: ~/.gcp/ansible-sa.json
+gcp_image: projects/ubuntu-os-cloud/global/images/family/ubuntu-2204-lts
+
+# ---------- Names ----------
+prefix: devops
+subnet_cidr: 10.10.0.0/24
+
+# ---------- Domain (A records are set at Namecheap) ----------
+domain: bluenodeops.online
+
+# ---------- SSH ----------
+ssh_user: devops
+ssh_pubkey_file: ~/.ssh/id_ed25519.pub
+
+machines:
+  - name: jenkins
+    machine_type: e2-medium
+    disk_gb: 30
+    port: 8080
+  - name: sonarqube
+    machine_type: e2-standard-2 
+    disk_gb: 30
+    port: 9000
+  - name: nexus
+    machine_type: e2-medium
+    disk_gb: 40
+    port: 8081

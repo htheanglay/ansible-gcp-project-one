@@ -1,0 +1,7 @@
+---
+# Copy to group_vars/all/vault.yml, fill in, then:
+#   ansible-vault encrypt group_vars/all/vault.yml
+# Run playbooks with --ask-vault-pass (or --vault-password-file).
+vault_sonar_db_password: change-me
+vault_jenkins_admin_password: change-me
+vault_nexus_admin_password: change-me

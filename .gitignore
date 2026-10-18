@@ -1,0 +1,8 @@
+# Secrets: never commit (copy vault.yml.example to vault.yml and encrypt it)
+group_vars/all/vault.yml
+.vault_pass
+*.json
+
+# Ansible leftovers
+*.retry
+*.log
